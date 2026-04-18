@@ -1,0 +1,16 @@
+Build a Car Inventory Manager inside the provided boilerplate app.
+
+Requirements:
+- Use the existing Apollo GraphQL client and the provided GET_CARS, GET_CAR, and ADD_CAR operations.
+- Show a list of cars with make, model, year, color, and responsive images.
+- Render the correct image URL by viewport width:
+  - mobile at widths up to 640px
+  - tablet from 641px to 1023px
+  - desktop at 1024px and above
+- Present cars with Material UI cards.
+- Provide a Material UI form to add a new car using the existing AddCar mutation.
+- After adding a car, refresh the inventory so the new car appears in the list.
+- Add search by model and sorting by year or make.
+- Extract the GraphQL and filtering logic into a reusable useCars() hook.
+- Add Vitest tests using @apollo/client/testing MockedProvider that follow the style of the provided Example test.
+
