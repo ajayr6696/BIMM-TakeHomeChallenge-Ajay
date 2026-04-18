@@ -1,0 +1,24 @@
+Use the existing React + TypeScript boilerplate only.
+
+Required constraints:
+- Use only packages already present in package.json.
+- Use Apollo Client hooks with queries imported from "@/graphql/queries".
+- Do not define new gql operations.
+- Use Material UI components and useMediaQuery for responsive images.
+- Use alias imports such as "@/components/...", "@/hooks/...", "@/graphql/...", "@/types".
+- Do not modify files under src/graphql/ or src/mocks/.
+- Keep TypeScript strict-safe with no implicit any and no unused locals.
+- Use vitest and @testing-library/react.
+- In tests, use MockedProvider and request: { query: QUERY_NAME }.
+- Do not use gql inside tests.
+- Follow the style of src/components/Example.tsx and src/__tests__/Example.test.tsx.
+- Do not modify or delete the Example files.
+- Only add the planned files and optionally update src/App.tsx.
+
+Functional expectations:
+- Show cars from GET_CARS.
+- Add cars with ADD_CAR and refresh the list.
+- Support model search and sorting by year or make.
+- Choose mobile image for max-width 640px.
+- Choose tablet image for widths 641px to 1023px.
+- Choose desktop image for widths 1024px and above.
