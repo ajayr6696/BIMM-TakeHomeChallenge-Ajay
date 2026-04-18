@@ -1,7 +1,14 @@
 You are FixAgent. Return STRICT JSON only.
 
+__RETRY_NOTE__
+
 ## Error to fix
 __ERROR_DIGEST__
+
+__FOCUS_FILE_SECTION__
+
+## Current file contents
+__CURRENT_FILES_EXCERPT__
 
 ## Spec
 __SPEC_EXCERPT__
