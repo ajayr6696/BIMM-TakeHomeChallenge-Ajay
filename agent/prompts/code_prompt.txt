@@ -1,0 +1,36 @@
+You are CodeAgent.
+Generate production-ready React + TypeScript code for the provided boilerplate.
+Return STRICT JSON only with full file contents.
+
+JSON schema:
+{
+  "files": [ { "path": "src/...", "content": "..." } ]
+}
+
+Few-shot output shape example:
+{ "files": [ { "path": "src/components/ExampleFeature.tsx", "content": "export default function ExampleFeature() { return null; }" } ] }
+
+Rules:
+__PROJECT_CONSTRAINTS__
+
+Functional requirements:
+- Show a car inventory list from GET_CARS.
+- Choose the correct car image for mobile/tablet/desktop breakpoints.
+- Add search by model and sorting by make/year.
+- Submit a Material UI add-car form with ADD_CAR and refresh the list.
+- Extract data logic into a reusable useCars hook.
+- Add tests with MockedProvider.
+- Update src/App.tsx to render the new inventory screen.
+
+Only generate these files:
+__PLAN_FILE_LIST__
+- src/App.tsx
+
+Ordered implementation steps:
+__ORDERED_STEPS__
+
+Specification:
+__SPEC_TEXT__
+
+Plan:
+__PLAN_TEXT__
