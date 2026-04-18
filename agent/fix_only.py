@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -17,8 +18,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from agent.core.fix_agent import FixAgent  # noqa: E402
+from agent.core.fs import FileSystem  # noqa: E402
 from agent.core.planner_agent import PlannerAgent  # noqa: E402
 from agent.core.validator_agent import ValidatorAgent  # noqa: E402
+
+MAX_RETRIES = 3
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -27,11 +31,29 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--spec", required=True, help="Path to spec text file.")
     parser.add_argument("--output", required=True, help="Path to the generated output app.")
     parser.add_argument("--offline", action="store_true", help="Run without external LLM calls.")
+    parser.add_argument("--dry-run", action="store_true", help="Print returned fixes without writing files.")
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=MAX_RETRIES,
+        help=f"Maximum fix attempts before giving up (default: {MAX_RETRIES}).",
+    )
     return parser.parse_args(argv)
 
 
+def _extract_error_digest(typecheck_log: str, test_log: str) -> str:
+    """Workflow F2: Trim validator logs down to the most useful failure lines."""
+    lines = (typecheck_log + "\n" + test_log).splitlines()
+    kept = [
+        line
+        for line in lines
+        if "FAIL" in line or "error" in line.lower() or "Unable to find an element" in line
+    ]
+    return "\n".join(kept[:40]) if kept else "\n".join(lines[-40:])
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Workflow F2: Validate the current app once and ask FixAgent for direct repairs."""
+    """Workflow F3: Retry focused repairs and roll back failed attempts."""
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     spec_path = Path(args.spec).resolve()
     output_dir = Path(args.output).resolve()
@@ -42,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     planner = PlannerAgent(offline=True)
     validator = ValidatorAgent()
     fixer = FixAgent(offline=offline)
+    fs = FileSystem()
 
     plan = planner.plan(spec_text)
     validation = validator.validate(output_dir)
@@ -49,14 +72,49 @@ def main(argv: list[str] | None = None) -> int:
         print("[fix-only] Validation already passed. Nothing to fix.")
         return 0
 
-    fixes = fixer.fix(spec_text, plan, validation, output_dir)
-    if not fixes:
-        print("[fix-only] FixAgent returned no fixes.")
-        return 1
+    for attempt in range(1, args.max_retries + 1):
+        error_digest = _extract_error_digest(validation.typecheck_log, validation.test_log)
+        focus_file = None
+        matches = re.findall(r"\b(src/[\w/.-]+\.(?:tsx?|jsx?))\b", error_digest)
+        if matches:
+            focus_file = matches[0]
 
-    print("[fix-only] Proposed fixes:")
-    for generated_file in fixes:
-        print(f"[fix-only]   - {generated_file.path}")
+        fixes = fixer.fix(
+            spec_text,
+            plan,
+            validation,
+            output_dir,
+            error_digest=error_digest,
+            focus_file=focus_file,
+            attempt=attempt,
+        )
+        if not fixes:
+            print("[fix-only] FixAgent returned no fixes.")
+            return 1
+
+        print("[fix-only] Proposed fixes:")
+        for generated_file in fixes:
+            print(f"[fix-only]   - {generated_file.path}")
+        if args.dry_run:
+            return 0
+
+        backups: dict[str, str] = {}
+        for generated_file in fixes:
+            target_path = output_dir / generated_file.path
+            if target_path.exists():
+                backups[generated_file.path] = target_path.read_text(encoding="utf-8")
+            fs.write_text(target_path, generated_file.content)
+
+        post_validation = validator.validate(output_dir)
+        if post_validation.ok:
+            print("[fix-only] Validation passed after fixes.")
+            return 0
+
+        for path, content in backups.items():
+            fs.write_text(output_dir / path, content)
+        validation = post_validation
+
+    print("[fix-only] Exiting with failure.")
     return 0
 
 
