@@ -1,1 +1,2 @@
-"""Agent package for the BIMM take-home workflow."""
+"""Agent package for BIMM take-home challenge."""
+

@@ -1,1 +1,2 @@
-"""Core agent modules."""
+"""Core implementation for the multi-agent generator."""
+
