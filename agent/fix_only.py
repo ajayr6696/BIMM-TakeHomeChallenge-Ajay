@@ -11,7 +11,6 @@ import argparse
 import os
 import re
 import sys
-from collections import Counter
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +19,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 from agent.core.fix_agent import FixAgent  # noqa: E402
 from agent.core.fs import FileSystem  # noqa: E402
-from agent.core.models import GeneratedFile  # noqa: E402
 from agent.core.planner_agent import PlannerAgent  # noqa: E402
 from agent.core.validator_agent import ValidatorAgent  # noqa: E402
 
@@ -29,7 +27,11 @@ MAX_LOG_LINES = 40
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    """Workflow F1: Parse CLI arguments for an isolated fix-only run."""
+    """Workflow F1: Parse CLI arguments for an isolated fix-only run.
+
+    This wrapper intentionally stays small: it validates an already generated
+    app, calls the shared FixAgent, and manages retries/rollback around it.
+    """
     parser = argparse.ArgumentParser(description="Run FixAgent on an existing generated app.")
     parser.add_argument("--spec", required=True, help="Path to spec text file.")
     parser.add_argument(
@@ -57,7 +59,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def _extract_error_digest(validation) -> str:
-    """Workflow F2: Shrink raw validator logs into a compact retry prompt digest."""
+    """Workflow F2: Shrink raw validator logs into a compact retry prompt digest.
+
+    The digest keeps the highest-signal lines so retry prompts stay readable and
+    small enough for the model without losing the core failure symptoms.
+    """
     sections: list[str] = []
 
     typecheck_lines = validation.typecheck_log.splitlines()
@@ -100,74 +106,6 @@ def _count_failed_tests(test_log: str) -> int | None:
     return None
 
 
-def _camel_tokens(value: str) -> list[str]:
-    """Workflow F4: Split a file stem into lower-cased search tokens for log scoring."""
-    parts = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", value)
-    return [part.lower() for part in parts if part]
-
-
-def _should_force_canonical_car_card(validation, focus_file: str | None) -> bool:
-    """Workflow F4A: Detect the known CarCard regression pattern and bypass the LLM."""
-    if focus_file != "src/components/CarCard.tsx":
-        return False
-    if "error TS" in validation.typecheck_log:
-        return False
-    lowered = validation.test_log.lower()
-    title_or_alt_missing = (
-        "unable to find an element with the text:" in lowered
-        or "unable to find an element with the alt text:" in lowered
-    )
-    image_selection_failure = (
-        "desktop image" in lowered
-        or "mobile image" in lowered
-        or "tablet image" in lowered
-        or "toyota camry" in lowered
-    )
-    return title_or_alt_missing or image_selection_failure
-
-
-def _infer_focus_file(validation, candidate_paths: list[str]) -> str | None:
-    """Workflow F5: Infer the single most likely source file from test/typecheck failures."""
-    raw = f"{validation.typecheck_log}\n{validation.test_log}"
-    lowered = raw.lower()
-    matches = re.findall(r"\b(src/[\w/.-]+\.(?:tsx?|jsx?))\b", raw)
-    if matches:
-        normalized_candidates = set(candidate_paths)
-        non_test_matches = [
-            match for match in matches if "/__tests__/" not in match and match in normalized_candidates
-        ]
-        target_matches = non_test_matches or [match for match in matches if match in normalized_candidates]
-        if target_matches:
-            return Counter(target_matches).most_common(1)[0][0]
-
-    scored: list[tuple[int, str]] = []
-    for path in candidate_paths:
-        stem = Path(path).stem
-        score = 0
-        if path.lower() in lowered:
-            score += 12
-        if stem.lower() in lowered:
-            score += 8
-
-        tokens = _camel_tokens(stem)
-        if tokens and all(token in lowered for token in tokens):
-            score += 5
-        score += sum(1 for token in tokens if token in lowered)
-
-        parent = Path(path).parent.name.lower()
-        if parent and parent in lowered:
-            score += 1
-
-        if score > 0:
-            scored.append((score, path))
-
-    if not scored:
-        return None
-
-    scored.sort(key=lambda item: (-item[0], candidate_paths.index(item[1])))
-    return scored[0][1]
-
-
 def _is_balanced(text: str, opening: str, closing: str) -> bool:
     """Workflow F6: Perform a lightweight balance check for generated source text."""
     depth = 0
@@ -182,7 +120,11 @@ def _is_balanced(text: str, opening: str, closing: str) -> bool:
 
 
 def _looks_like_complete_source(path: str, content: str) -> bool:
-    """Workflow F7: Reject partial or obviously malformed source replacements early."""
+    """Workflow F7: Reject partial or obviously malformed source replacements early.
+
+    fix_only writes full-file replacements, so partial snippets or wrapped JSON
+    responses must be blocked before they ever touch disk.
+    """
     stripped = content.strip()
     if len(stripped) < 120:
         return False
@@ -203,7 +145,7 @@ def _looks_like_complete_source(path: str, content: str) -> bool:
 
 
 def _extract_expected_anchors(path: str, original: str) -> list[str]:
-    """Workflow F8: Extract key declarations/imports from the original file as safety anchors."""
+    """Workflow F8: Extract stable declarations/imports from the original file as safety anchors."""
     normalized_original = _normalize_for_anchor_check(original)
     raw_candidates: list[str] = []
 
@@ -279,7 +221,11 @@ def _contains_obvious_garbage(path: str, content: str) -> bool:
 
 
 def _accept_fix(path: str, original: str | None, updated: str) -> tuple[bool, str]:
-    """Workflow F12: Apply pre-write safety checks to one proposed file replacement."""
+    """Workflow F12: Apply pre-write safety checks to one proposed file replacement.
+
+    The goal is to reject low-quality fixes cheaply so the retry loop can move
+    on without corrupting the current generated app.
+    """
     if not _looks_like_complete_source(path, updated):
         snippet = updated.strip().replace("\n", "\\n")
         return False, f"replacement does not look like a complete source file | snippet: {snippet[:260]}"
@@ -293,47 +239,12 @@ def _accept_fix(path: str, original: str | None, updated: str) -> tuple[bool, st
     return True, ""
 
 
-def _canonical_car_card() -> str:
-    """Workflow F13: Provide the deterministic known-good CarCard implementation."""
-    return """import { Card, CardContent, CardMedia, Chip, Stack, Typography, useMediaQuery } from "@mui/material";
-import type { Car } from "@/types";
-
-type CarCardProps = {
-  car: Car;
-};
-
-export default function CarCard({ car }: CarCardProps) {
-  const isMobile = useMediaQuery("(max-width:640px)");
-  const isTablet = useMediaQuery("(min-width:641px) and (max-width:1023px)");
-  const imageSrc = isMobile ? car.mobile : isTablet ? car.tablet : car.desktop;
-
-  return (
-    <Card elevation={2} sx={{ overflow: "hidden" }}>
-      <CardMedia
-        component="img"
-        height="220"
-        image={imageSrc}
-        alt={`${car.year} ${car.make} ${car.model}`}
-      />
-      <CardContent>
-        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2}>
-          <div>
-            <Typography variant="h6">
-              {car.year} {car.make} {car.model}
-            </Typography>
-            <Typography color="text.secondary">{car.color}</Typography>
-          </div>
-          <Chip label={car.make} color="primary" variant="outlined" />
-        </Stack>
-      </CardContent>
-    </Card>
-  );
-}
-"""
-
-
 def main(argv: list[str] | None = None) -> int:
-    """Workflow F14: Validate, focus, fix, verify, and roll back if retries still fail."""
+    """Workflow F13: Validate, fix, verify, and roll back if retries still fail.
+
+    Unlike the full orchestrator, this path starts from an already generated app
+    and exists mainly to exercise the shared FixAgent in isolation.
+    """
     os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -371,29 +282,17 @@ def main(argv: list[str] | None = None) -> int:
         # Workflow F14C: Build focused retry context from the latest validation failure.
         print(f"[fix-only] Running FixAgent (attempt {attempt}/{args.max_retries})...")
         error_digest = _extract_error_digest(validation)
-        focus_candidates = list(dict.fromkeys(plan.components + ["src/App.tsx"]))
-        focus_file = _infer_focus_file(validation, focus_candidates)
+        focus_file = fixer.infer_focus_file(validation, plan, output_dir)
         print(f"[fix-only] Focus file inferred: {focus_file or 'none'}")
-
-        # Workflow F14D: For known CarCard regressions, prefer the deterministic repair path.
-        if _should_force_canonical_car_card(validation, focus_file):
-            print("[fix-only] Using canonical CarCard fallback before LLM fix attempt.")
-            fixes = [
-                GeneratedFile(
-                    path="src/components/CarCard.tsx",
-                    content=_canonical_car_card(),
-                )
-            ]
-        else:
-            fixes = fixer.fix(
-                spec_text,
-                plan,
-                validation,
-                output_dir,
-                error_digest=error_digest,
-                focus_file=focus_file,
-                attempt=attempt,
-            )
+        fixes = fixer.fix(
+            spec_text,
+            plan,
+            validation,
+            output_dir,
+            error_digest=error_digest,
+            focus_file=focus_file,
+            attempt=attempt,
+        )
         if not fixes:
             print("[fix-only] FixAgent returned no fixes.")
             break
@@ -418,18 +317,8 @@ def main(argv: list[str] | None = None) -> int:
                 generated_file.content,
             )
             if not accepted:
-                # Workflow F14F: If the model picked CarCard but drifted structurally, substitute
-                # the canonical fallback instead of failing the entire attempt immediately.
-                if generated_file.path == "src/components/CarCard.tsx":
-                    print(f"[fix-only] Rejected {generated_file.path}: {reason}")
-                    print("[fix-only] Using canonical CarCard fallback.")
-                    fallback_content = _canonical_car_card()
-                    accepted = True
-                    reason = ""
-                    generated_file.content = fallback_content
-                else:
-                    print(f"[fix-only] Rejected {generated_file.path}: {reason}")
-                    continue
+                print(f"[fix-only] Rejected {generated_file.path}: {reason}")
+                continue
             if original_content is not None:
                 attempt_backups[generated_file.path] = original_content
                 if generated_file.path not in previous_contents:
