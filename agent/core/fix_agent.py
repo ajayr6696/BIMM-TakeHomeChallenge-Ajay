@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 
 from agent.core.llm import LLMError, call_llm, must_parse_json, shorten_for_prompt
@@ -20,8 +21,59 @@ class FixAgent:
     """
 
     def __init__(self, offline: bool) -> None:
-        """Workflow X1: Configure whether fix attempts may call the external LLM."""
+        """Workflow X1: Record whether this fixer may call the external LLM service."""
         self._offline = offline
+
+    def infer_focus_file(self, validation: ValidationResult, plan: Plan, app_dir: Path | None = None) -> str | None:
+        """Workflow X1A: Pick the most likely broken implementation file from the latest failures.
+
+        The inference stays generic:
+        - first prefer direct file-path mentions from the validator logs
+        - then score candidate component files by filename matches
+        - finally boost files whose current contents look like they render the
+          failing text/image assertions
+        """
+        candidate_paths = list(dict.fromkeys(plan.components + ["src/App.tsx"]))
+        raw = f"{validation.typecheck_log}\n{validation.test_log}"
+        lowered = raw.lower()
+        matches = re.findall(r"\b(src/[\w/.-]+\.(?:tsx?|jsx?))\b", raw)
+        if matches:
+            normalized_candidates = set(candidate_paths)
+            non_test_matches = [
+                match for match in matches if "/__tests__/" not in match and match in normalized_candidates
+            ]
+            target_matches = non_test_matches or [match for match in matches if match in normalized_candidates]
+            if target_matches:
+                return Counter(target_matches).most_common(1)[0][0]
+
+        scored: list[tuple[int, str]] = []
+        for path in candidate_paths:
+            stem = Path(path).stem
+            score = 0
+            if path.lower() in lowered:
+                score += 12
+            if stem.lower() in lowered:
+                score += 8
+
+            tokens = self._camel_tokens(stem)
+            if tokens and all(token in lowered for token in tokens):
+                score += 5
+            score += sum(1 for token in tokens if token in lowered)
+
+            parent = Path(path).parent.name.lower()
+            if parent and parent in lowered:
+                score += 1
+
+            score += self._score_candidate_file_contents(path, app_dir, lowered)
+
+            if score > 0:
+                scored.append((score, path))
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda item: (-item[0], candidate_paths.index(item[1])))
+        return scored[0][1]
 
     def fix(
         self,
@@ -34,9 +86,16 @@ class FixAgent:
         focus_file: str | None = None,
         attempt: int = 1,
     ) -> list[GeneratedFile]:
-        """Workflow X2: Build focused fix context, call the model, and normalize candidates."""
+        """Workflow X2: Produce safe full-file repair candidates for the current validation failure.
+
+        This method is the shared repair entrypoint used by both the full
+        orchestrator flow and the standalone fix-only runner.
+        """
         if self._offline:
             return []
+
+        if focus_file is None:
+            focus_file = self.infer_focus_file(validation, plan, app_dir)
 
         # Workflow X2A: Lock onto one implementation file when fix_only already inferred it.
         focus_locked = focus_file in plan.components if focus_file else False
@@ -119,23 +178,43 @@ class FixAgent:
         allowed = set(allowed_paths)
         selected: dict[str, GeneratedFile] = {}
         dropped: list[str] = []
-        for item in data.get("files", []):
-            path = str(item["path"])
-            content = str(item.get("content", ""))
-            if path not in allowed:
-                dropped.append(path)
-                continue
-            # Workflow X2E: Reject wrapped/truncated outputs before they reach fix_only.
-            is_valid, reason = self._validate_full_file(path, content)
-            if not is_valid:
-                snippet = shorten_for_prompt(content, 240).replace("\n", "\\n")
-                print(f"[fix-agent] Rejected malformed replacement for {path}: {reason}")
-                print(f"[fix-agent] Replacement snippet: {snippet}")
-                continue
-            selected[path] = GeneratedFile(path=path, content=content)
+        malformed_items = 0
+        files: list[GeneratedFile] = []
+        # Workflow X2E: When a single focused implementation file is known, prefer the
+        # tighter one-file repair prompt before trusting a broad multi-file answer.
+        if focus_file and focus_file in allowed and app_dir is not None and focus_locked:
+            focused_fix = self._retry_with_single_file_prompt(
+                spec_excerpt=spec_excerpt,
+                test_excerpt=test_excerpt,
+                focus_file=focus_file,
+                app_dir=app_dir,
+            )
+            if focused_fix is not None:
+                files = [focused_fix]
+        if not files:
+            for item in data.get("files", []):
+                if not isinstance(item, dict):
+                    malformed_items += 1
+                    continue
+                raw_path = item.get("path")
+                if not raw_path:
+                    malformed_items += 1
+                    continue
+                path = str(raw_path)
+                content = str(item.get("content", ""))
+                if path not in allowed:
+                    dropped.append(path)
+                    continue
+                is_valid, reason = self._validate_full_file(path, content)
+                if not is_valid:
+                    snippet = shorten_for_prompt(content, 240).replace("\n", "\\n")
+                    print(f"[fix-agent] Rejected malformed replacement for {path}: {reason}")
+                    print(f"[fix-agent] Replacement snippet: {snippet}")
+                    continue
+                selected[path] = GeneratedFile(path=path, content=content)
+            files = list(selected.values())
 
-        files = list(selected.values())
-        # Workflow X2F: If the broad prompt failed, retry once with a one-file-only repair prompt.
+        # Workflow X2F: If the broad path also failed, retry once with a one-file-only repair prompt.
         if not files and focus_file and focus_file in allowed and app_dir is not None:
             focused_fix = self._retry_with_single_file_prompt(
                 spec_excerpt=spec_excerpt,
@@ -145,25 +224,17 @@ class FixAgent:
             )
             if focused_fix is not None:
                 files = [focused_fix]
-        # Workflow X2G: For the known CarCard regression family, provide a deterministic backup.
-        if (
-            not files
-            and focus_file == "src/components/CarCard.tsx"
-            and app_dir is not None
-        ):
-            heuristic_fix = self._heuristic_fix_car_card(app_dir / focus_file)
-            if heuristic_fix is not None:
-                print("[fix-agent] Using deterministic CarCard fallback.")
-                files = [GeneratedFile(path=focus_file, content=heuristic_fix)]
         if dropped:
             print(f"[fix-agent] Dropped non-allowlisted fixes: {', '.join(dropped)}")
+        if malformed_items:
+            print(f"[fix-agent] Dropped malformed file entries: {malformed_items}")
         if not files:
             print("[fix-agent] Model returned no allowlisted file replacements.")
         return files
 
     @staticmethod
     def _build_retry_note(attempt: int, focus_file: str | None) -> str:
-        """Workflow X3: Add a retry banner so later attempts see residual failure context."""
+        """Workflow X3: Add retry context so later attempts understand prior failures."""
         if attempt <= 1:
             return ""
         focus_hint = f" Focus especially on {focus_file}." if focus_file else ""
@@ -174,7 +245,7 @@ class FixAgent:
 
     @staticmethod
     def _build_focus_section(focus_file: str | None) -> str:
-        """Workflow X4: Put the primary suspect file near the top of the prompt."""
+        """Workflow X4: Put the inferred suspect file near the top of the prompt."""
         if not focus_file:
             return ""
         return (
@@ -183,14 +254,58 @@ class FixAgent:
         )
 
     @staticmethod
+    def _camel_tokens(value: str) -> list[str]:
+        """Workflow X4A: Split a filename stem into lower-cased tokens for heuristic scoring."""
+        parts = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", value)
+        return [part.lower() for part in parts if part]
+
+    @staticmethod
+    def _score_candidate_file_contents(path: str, app_dir: Path | None, lowered_log: str) -> int:
+        """Workflow X4B: Use current file contents to prefer the component rendering the broken UI.
+
+        This helps leaf UI components win over container pages when the failure is
+        about missing text or alt text in the rendered output.
+        """
+        if app_dir is None:
+            return 0
+
+        file_path = app_dir / path
+        if not file_path.exists():
+            return 0
+        try:
+            content = file_path.read_text(encoding="utf-8").lower()
+        except OSError:
+            return 0
+
+        score = 0
+        text_or_alt_failure = (
+            "unable to find an element with the text:" in lowered_log
+            or "unable to find an element with the alt text:" in lowered_log
+        )
+        if text_or_alt_failure:
+            # Prefer leaf components that actually render text/image fields over container pages.
+            render_field_hits = re.findall(
+                r"\b\w+\.(year|make|model|title|name|label|image|src|alt|mobile|tablet|desktop)\b",
+                content,
+            )
+            score += min(len(render_field_hits), 10)
+            if "alt={" in content or 'alt={`${' in content:
+                score += 4
+            if "cardmedia" in content or 'component="img"' in content or "<img" in content:
+                score += 3
+            if "typography" in content or "return (" in content:
+                score += 2
+        return score
+
+    @staticmethod
     def _assert_no_placeholders(prompt: str) -> None:
-        """Workflow X5: Fail fast if any prompt template tokens were left unfilled."""
+        """Workflow X5: Fail fast if any prompt-template placeholders were left unfilled."""
         missed = re.findall(r"__[A-Z][A-Z0-9_]*__", prompt)
         if missed:
             raise ValueError(f"[fix-agent] Unfilled placeholders in prompt: {sorted(set(missed))}")
 
     def _preferred_fix_paths(self, validation: ValidationResult, plan: Plan) -> list[str]:
-        """Workflow X6: Bias the model toward implementation files for UI-behavior failures."""
+        """Workflow X6: Bias the prompt toward implementation files for UI-behavior failures."""
         behavior_assertion = (
             "Unable to find an element" in validation.test_log
             or "Expected" in validation.test_log
@@ -202,7 +317,7 @@ class FixAgent:
         return plan.components + plan.tests + ["src/App.tsx"]
 
     def _should_limit_to_implementation_files(self, validation: ValidationResult) -> bool:
-        """Workflow X7: For clean-typecheck UI failures, forbid test-file rewrites entirely."""
+        """Workflow X7: Decide when repair attempts should stay out of test files entirely."""
         behavior_assertion = (
             "Unable to find an element" in validation.test_log
             or "Expected" in validation.test_log
@@ -226,7 +341,7 @@ class FixAgent:
         focus_file: str | None = None,
         focus_only: bool = False,
     ) -> str:
-        """Workflow X8: Collect only the current allowlisted file text needed for this retry."""
+        """Workflow X8: Gather the current allowlisted file contents needed for this retry prompt."""
         if app_dir is None:
             return "(No current file context provided.)"
 
@@ -256,7 +371,7 @@ class FixAgent:
         return shorten_for_prompt("\n\n".join(chunks), 4200)
 
     def _extract_relevant_log_excerpt(self, log_text: str, max_chars: int) -> str:
-        """Workflow X9: Keep only the high-signal error lines from large validator output."""
+        """Workflow X9: Keep only the highest-signal lines from a large validator log."""
         if not log_text.strip():
             return "(empty)"
 
@@ -286,7 +401,7 @@ class FixAgent:
         return shorten_for_prompt(excerpt or log_text, max_chars)
 
     def _validate_full_file(self, path: str, content: str) -> tuple[bool, str]:
-        """Workflow X10: Perform lightweight structural checks on model-returned full files."""
+        """Workflow X10: Reject obviously incomplete or non-source replacements before writing."""
         stripped = content.strip()
         if len(stripped) < 80:
             return False, "content too short to be a full file"
@@ -309,7 +424,7 @@ class FixAgent:
         return True, ""
 
     def _salvage_failed_generation(self, error_text: str) -> dict[str, object] | None:
-        """Workflow X11: Recover usable file payloads from Groq json_validate_failed errors."""
+        """Workflow X11: Recover usable file payloads from malformed Groq JSON-mode failures."""
         if "failed_generation" not in error_text:
             return None
 
@@ -338,7 +453,7 @@ class FixAgent:
         return {"files": files}
 
     def _decode_salvaged_content(self, raw_content: str) -> str | None:
-        """Workflow X12: Decode escaped near-JSON file content into raw source text."""
+        """Workflow X12: Decode escaped near-JSON file content back into raw source text."""
         try:
             return json.loads(f'"{raw_content}"')
         except json.JSONDecodeError:
@@ -349,7 +464,7 @@ class FixAgent:
             return candidate or None
 
     def _extract_failed_generation_payload(self, error_text: str) -> str | None:
-        """Workflow X13: Isolate the failed_generation blob from a Groq error string."""
+        """Workflow X13: Isolate the `failed_generation` blob from a Groq error string."""
         match = re.search(r"'failed_generation':\s*'(?P<payload>.*)'}\}$", error_text, re.DOTALL)
         if match:
             return match.group("payload")
@@ -359,7 +474,7 @@ class FixAgent:
         return None
 
     def _extract_file_pairs_from_payload(self, payload: str) -> list[tuple[str, str]]:
-        """Workflow X14: Pull `(path, content)` pairs out of malformed failed_generation JSON."""
+        """Workflow X14: Pull `(path, content)` pairs out of malformed `failed_generation` JSON."""
         pairs: list[tuple[str, str]] = []
         path_pattern = re.compile(r'"path":\s*"([^"]+)"', re.DOTALL)
         position = 0
@@ -408,7 +523,7 @@ class FixAgent:
         return pairs
 
     def _extract_content_by_boundary(self, payload: str, content_start: int) -> str | None:
-        """Workflow X15: Fallback boundary scan when JSON string escaping is incomplete."""
+        """Workflow X15: Use boundary scanning when malformed JSON strings never close cleanly."""
         boundaries = [
             re.compile(r'"\s*},\s*{\s*"path":', re.DOTALL),
             re.compile(r'"\s*}\s*]\s*$', re.DOTALL),
@@ -424,7 +539,7 @@ class FixAgent:
         return segment[:boundary_index]
 
     def _normalize_files_payload(self, data: object) -> dict[str, object] | None:
-        """Workflow X16: Accept either `{files:[...]}` or a bare JSON array from the model."""
+        """Workflow X16: Normalize supported model payload shapes into a `{files:[...]}` dict."""
         if isinstance(data, dict):
             files = data.get("files")
             if isinstance(files, list):
@@ -442,19 +557,25 @@ class FixAgent:
         focus_file: str,
         app_dir: Path,
     ) -> GeneratedFile | None:
-        """Workflow X17: Make one small second-pass LLM call for the focused file only."""
+        """Workflow X17: Run a smaller second-pass LLM repair for one focused file only.
+
+        This path is intentionally narrower and stronger than the broad prompt so
+        small UI regressions can be repaired with less drift.
+        """
         file_path = app_dir / focus_file
         if not file_path.exists():
             return None
 
         original_content = file_path.read_text(encoding="utf-8")
         preserve_rules = self._build_preserve_rules(original_content)
+        expected_assertions = self._extract_expected_assertions(test_excerpt)
         focused_prompt = (
             "You are FixAgent.\n"
             "Return STRICT JSON only.\n"
             "You must repair exactly one existing React/TypeScript file with the smallest possible edit.\n\n"
             f"Spec:\n{spec_excerpt}\n\n"
             f"Failing tests:\n{test_excerpt}\n\n"
+            f"{expected_assertions}"
             f"Target file path:\n{focus_file}\n\n"
             "Current file content:\n"
             f"{original_content}\n\n"
@@ -463,6 +584,7 @@ class FixAgent:
             "- Use the same file path.\n"
             "- Preserve imports, types, and component structure unless the failing tests require a small change.\n"
             "- Make the minimum possible fix.\n"
+            "- When the failing tests include exact expected text or alt values, repair the file so those assertions pass.\n"
             f"{preserve_rules}"
             "- Return the full corrected file content, not a patch.\n\n"
             "JSON schema:\n"
@@ -492,60 +614,8 @@ class FixAgent:
         print(f"[fix-agent] Single-file retry produced a valid replacement for {focus_file}.")
         return GeneratedFile(path=path, content=content)
 
-    def _heuristic_fix_car_card(self, file_path: Path) -> str | None:
-        """Workflow X18: Return the canonical CarCard implementation for known-safe recovery."""
-        if not file_path.exists():
-            return None
-
-        current = file_path.read_text(encoding="utf-8")
-        required_markers = [
-            "CardMedia",
-            "Typography",
-            "useMediaQuery",
-            "CarCardProps",
-        ]
-        if not all(marker in current for marker in required_markers):
-            return None
-
-        # Deterministic canonical implementation for this challenge component.
-        return """import { Card, CardContent, CardMedia, Chip, Stack, Typography, useMediaQuery } from "@mui/material";
-import type { Car } from "@/types";
-
-type CarCardProps = {
-  car: Car;
-};
-
-export default function CarCard({ car }: CarCardProps) {
-  const isMobile = useMediaQuery("(max-width:640px)");
-  const isTablet = useMediaQuery("(min-width:641px) and (max-width:1023px)");
-  const imageSrc = isMobile ? car.mobile : isTablet ? car.tablet : car.desktop;
-
-  return (
-    <Card elevation={2} sx={{ overflow: "hidden" }}>
-      <CardMedia
-        component="img"
-        height="220"
-        image={imageSrc}
-        alt={`${car.year} ${car.make} ${car.model}`}
-      />
-      <CardContent>
-        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2}>
-          <div>
-            <Typography variant="h6">
-              {car.year} {car.make} {car.model}
-            </Typography>
-            <Typography color="text.secondary">{car.color}</Typography>
-          </div>
-          <Chip label={car.make} color="primary" variant="outlined" />
-        </Stack>
-      </CardContent>
-    </Card>
-    );
-}
-"""
-
     def _build_preserve_rules(self, original_content: str) -> str:
-        """Workflow X19: Tell the model to preserve key anchors from the focused original file."""
+        """Workflow X18: Tell the model which original anchors should survive the repair."""
         anchors = self._extract_preserve_anchors(original_content)
         if not anchors:
             return ""
@@ -555,7 +625,7 @@ export default function CarCard({ car }: CarCardProps) {
         return "".join(rules)
 
     def _extract_preserve_anchors(self, original_content: str) -> list[str]:
-        """Workflow X20: Pull stable declarations/imports from the current file for retry prompts."""
+        """Workflow X19: Pull stable declarations/imports from the current file for retry prompts."""
         anchors: list[str] = []
         seen: set[str] = set()
         patterns = [
@@ -579,3 +649,34 @@ export default function CarCard({ car }: CarCardProps) {
             if len(anchors) >= 6:
                 break
         return anchors
+
+    @staticmethod
+    def _extract_expected_assertions(test_excerpt: str) -> str:
+        """Workflow X20: Pull exact text/alt assertions from failures for the focused retry prompt.
+
+        Feeding these exact expected values back into the one-file prompt helps the
+        model repair small rendering regressions without guessing the intended UI.
+        """
+        patterns = [
+            r"Unable to find an element with the text:\s*([^\n.]+)",
+            r"Unable to find an element with the alt text:\s*([^\n.]+)",
+        ]
+        expected: list[str] = []
+        seen: set[str] = set()
+        for pattern in patterns:
+            for match in re.findall(pattern, test_excerpt, flags=re.IGNORECASE):
+                value = match.strip().strip('"').strip("'")
+                if value and value not in seen:
+                    expected.append(value)
+                    seen.add(value)
+                if len(expected) >= 5:
+                    break
+            if len(expected) >= 5:
+                break
+        if not expected:
+            return ""
+        lines = ["Expected assertions from the failing tests:\n"]
+        for value in expected:
+            lines.append(f"- {value}\n")
+        lines.append("\n")
+        return "".join(lines)
