@@ -20,6 +20,8 @@ BIMM-TakeHomeChallenge-Ajay/
 
 I used Python for the agent because the workflow is primarily orchestration: read the spec, plan tasks, call the LLM, write files, run shell validation commands, and coordinate retries. Python kept that loop concise, explicit, and easy to reason about without adding extra framework overhead. It also made it straightforward to separate the control-flow code from the React/TypeScript output being generated.
 
+Python also has a very strong ecosystem for data processing and AI work, including libraries such as `pandas` and `numpy` for data handling, and frameworks such as `PyTorch` and `TensorFlow` for machine learning, deep learning, and NLP-related workflows. Since I already have experience using Python and these kinds of libraries, it felt like the most natural choice for building this agent quickly and cleanly.
+
 ### Local setup
 
 - Prereqs: Node.js (npm) and Python 3.10+
@@ -383,7 +385,7 @@ The fix path is more defensive than the initial implementation.
 - When a single focus file is known, it can lock both the prompt context and the writable paths to that file.
 - If the broad prompt fails to produce a usable result, `FixAgent` retries once with a smaller one-file-only repair prompt that preserves key anchors from the current file.
 - If Groq returns a `json_validate_failed` error, `FixAgent` attempts to salvage file content from `failed_generation`.
-- For the known `CarCard.tsx` regression family, a deterministic canonical fallback exists as a last-resort repair path.
+- If the broad prompt fails to produce a usable result, the fixer falls back to a smaller one-file retry path using the inferred focus file.
 
 ### Deterministic fallback path
 
