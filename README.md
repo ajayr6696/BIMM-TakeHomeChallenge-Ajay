@@ -1,4 +1,4 @@
-## Multi-Agent React Code Generator
+## Agentic AI: Multi-Agent React Code Generator
 
 This repository contains a Python CLI agent that reads a text specification and generates a working React + TypeScript app in `generated-app/`, starting from the provided immutable boilerplate in `Fullstack-Coding-Challenge-main/`.
 
