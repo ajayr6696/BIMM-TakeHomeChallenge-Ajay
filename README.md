@@ -1,11 +1,11 @@
-## BIMM Take-Home: Multi-Agent React Code Generator
+##Multi-Agent React Code Generator
 
 This repository contains a Python CLI agent that reads a text specification and generates a working React + TypeScript app in `generated-app/`, starting from the provided immutable boilerplate in `Fullstack-Coding-Challenge-main/`.
 
 ### Project structure
 
 ```text
-BIMM-TakeHomeChallenge-Ajay/
+Multi-Agent-React-Code-Generator/
   agent/                           # Python CLI agent implementation
     core/                          # planner/generator/validator/fixer/orchestrator
     prompts/                       # text prompt templates used by Planner/Code/Fix agents
@@ -29,8 +29,8 @@ Python also has a very strong ecosystem for data processing and AI work, includi
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/ajayr6696/BIMM-TakeHomeChallenge-Ajay.git
-cd BIMM-TakeHomeChallenge-Ajay
+git clone https://github.com/ajayr6696/Multi-Agent-React-Code-Generator.git
+cd Multi-Agent-React-Code-Generator
 ```
 
 2. Create a Python virtual environment:
